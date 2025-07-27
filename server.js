@@ -1,10 +1,4 @@
-import express from 'express';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
+const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -12,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static('public'));
 
-// Routes
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -21,6 +15,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Properties API
 app.get('/api/properties', (req, res) => {
   res.json([
     {
@@ -42,81 +37,114 @@ app.get('/api/properties', (req, res) => {
   ]);
 });
 
-// Serve main page
+// Main page
 app.get('*', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Cuba Casa - Property Map</title>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-      <style>
-        body { margin: 0; font-family: Arial, sans-serif; }
-        #map { height: 100vh; width: 100%; }
-        .header { 
-          position: absolute; 
-          top: 20px; 
-          left: 20px; 
-          z-index: 1000; 
-          background: white; 
-          padding: 15px; 
-          border-radius: 8px; 
-          box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .header h1 { 
-          margin: 0; 
-          color: #c41e3a; 
-          font-size: 24px; 
-        }
-        .header p { 
-          margin: 5px 0 0 0; 
-          color: #666; 
-          font-size: 14px; 
-        }
-      </style>
-    </head>
-    <body>
-      <div class="header">
-        <h1>🏠 Cuba Casa</h1>
-        <p>Mapa de Propiedades en Cuba</p>
-      </div>
-      <div id="map"></div>
-      
-      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-      <script>
-        // Initialize map
-        const map = L.map('map').setView([23.1136, -82.3666], 7);
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cuba Casa - Mapa de Propiedades</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; }
+    
+    .header {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1000;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+      border-left: 4px solid #c41e3a;
+    }
+    
+    .header h1 {
+      color: #c41e3a;
+      font-size: 28px;
+      margin-bottom: 5px;
+      font-weight: bold;
+    }
+    
+    .header p {
+      color: #666;
+      font-size: 14px;
+      margin: 0;
+    }
+    
+    #map {
+      height: 100vh;
+      width: 100%;
+    }
+    
+    .leaflet-popup-content h3 {
+      color: #c41e3a;
+      margin-bottom: 10px;
+    }
+    
+    .leaflet-popup-content p {
+      margin: 5px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🏠 Cuba Casa</h1>
+    <p>Encuentra propiedades en Cuba</p>
+  </div>
+  
+  <div id="map"></div>
+  
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // Initialize map centered on Cuba
+    const map = L.map('map').setView([23.1136, -82.3666], 7);
+    
+    // Add OpenStreetMap tiles
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+    
+    // Custom marker icon
+    const houseIcon = L.divIcon({
+      html: '🏠',
+      iconSize: [30, 30],
+      className: 'custom-marker'
+    });
+    
+    // Load and display properties
+    fetch('/api/properties')
+      .then(response => response.json())
+      .then(properties => {
+        console.log('Propiedades cargadas:', properties.length);
         
-        // Add tile layer
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '© OpenStreetMap contributors'
-        }).addTo(map);
-        
-        // Load properties
-        fetch('/api/properties')
-          .then(response => response.json())
-          .then(properties => {
-            properties.forEach(property => {
-              L.marker([property.lat, property.lng])
-                .addTo(map)
-                .bindPopup(\`
-                  <div>
-                    <h3>\${property.title}</h3>
-                    <p><strong>Dirección:</strong> \${property.address}</p>
-                    <p><strong>Precio:</strong> \${property.price}</p>
-                  </div>
-                \`);
-            });
-          })
-          .catch(error => console.error('Error loading properties:', error));
-      </script>
-    </body>
-    </html>
-  `);
+        properties.forEach(property => {
+          L.marker([property.lat, property.lng], {icon: houseIcon})
+            .addTo(map)
+            .bindPopup(\`
+              <div style="min-width: 200px;">
+                <h3>\${property.title}</h3>
+                <p><strong>📍 Dirección:</strong> \${property.address}</p>
+                <p><strong>💰 Precio:</strong> \${property.price}</p>
+                <p style="margin-top: 10px; font-size: 12px; color: #888;">
+                  Haz clic para más detalles
+                </p>
+              </div>
+            \`);
+        });
+      })
+      .catch(error => {
+        console.error('Error cargando propiedades:', error);
+      });
+  </script>
+</body>
+</html>`);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(\`Cuba Casa server running on port \${PORT}\`);
+  console.log('Cuba Casa server running on port ' + PORT);
+  console.log('Visit: http://localhost:' + PORT);
 });
