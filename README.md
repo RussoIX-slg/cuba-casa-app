@@ -1,82 +1,35 @@
-# 🏠 Cuba Casa - Property Map Application
+# Cuba Casa - Simple Version
 
-Una aplicación web para explorar y publicar propiedades inmobiliarias en Cuba con mapa interactivo.
+Una versión simplificada de la aplicación de mapas de propiedades en Cuba, optimizada para deploy sin errores.
 
-## 🚀 Características
+## Características
+- Mapa interactivo de Cuba con Leaflet.js
+- API básica con propiedades de ejemplo
+- Sin dependencias complejas
+- Deploy garantizado en Render.com
 
-- **Mapa Interactivo**: Visualiza propiedades en un mapa de Cuba
-- **Gestión de Propiedades**: Agrega, edita y elimina propiedades
-- **Autenticación**: Sistema de registro y login seguro
-- **Subida de Fotos**: Hasta 7 fotos por propiedad
-- **Email Automático**: Notificaciones con SendGrid
-- **Responsive**: Optimizado para móvil y escritorio
+## Deploy en Render.com
 
-## 🛠️ Tecnologías
+### Configuración:
+- **Build Command:** `npm install`
+- **Start Command:** `npm start`
+- **Node Version:** 18
 
-- **Frontend**: React 18 + TypeScript + Tailwind CSS
-- **Backend**: Express.js + Node.js
-- **Base de Datos**: PostgreSQL (Neon Database)
-- **Mapas**: Leaflet.js
-- **Autenticación**: Passport.js
-- **Email**: SendGrid
-- **Deploy**: Render.com
-
-## 🌐 Deploy en Render.com
-
-### Variables de Entorno Requeridas:
+### Variables de Entorno (Opcionales):
 ```
-DATABASE_URL=postgresql://usuario:password@host/database
-SENDGRID_API_KEY=SG.xxxxx
-SESSION_SECRET=tu-secreto-super-seguro
 NODE_ENV=production
+PORT=3000
 ```
 
-### Configuración de Build:
-- **Build Command**: `npm run build`
-- **Start Command**: `npm start`
-- **Node Version**: 18
+## Funcionalidades
+- Mapa de Cuba centrado en La Habana
+- Marcadores con propiedades de ejemplo
+- API endpoint `/api/properties`
+- Interfaz responsive
 
-## 🏃‍♂️ Desarrollo Local
+## Tecnologías
+- Node.js + Express
+- Leaflet.js para mapas
+- HTML/CSS/JavaScript vanilla
 
-```bash
-# Instalar dependencias
-npm install
-
-# Configurar variables de entorno
-cp .env.example .env
-
-# Iniciar en modo desarrollo
-npm run dev
-```
-
-## 📱 Funcionalidades
-
-### Para Visitantes:
-- Ver propiedades en el mapa
-- Buscar por zona
-- Ver detalles y fotos
-
-### Para Usuarios Registrados:
-- Agregar nuevas propiedades
-- Editar sus propiedades
-- Eliminar sus propiedades
-- Recibir emails de confirmación
-
-## 🗺️ Estructura del Proyecto
-
-```
-cuba-casa-app/
-├── client/          # Frontend React
-├── server/          # Backend Express
-├── shared/          # Tipos compartidos
-├── uploads/         # Archivos subidos
-└── dist/           # Build de producción
-```
-
-## 📄 Licencia
-
-MIT License - Uso libre para proyectos personales y comerciales.
-
----
-
-Desarrollado con ❤️ para la comunidad cubana.
+Esta versión está diseñada para funcionar sin errores en cualquier plataforma de hosting.
