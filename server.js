@@ -1,150 +1,739 @@
 const express = require('express');
+const session = require('express-session');
+const connectPgSimple = require('connect-pg-simple');
+const path = require('path');
+const fs = require('fs');
+const { Pool } = require('@neondatabase/serverless');
+const multer = require('multer');
+const sgMail = require('@sendgrid/mail');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Database setup
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// Configure SendGrid
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
+
+// Configure file upload
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  }
+});
+
+// Session setup
+const pgSession = connectPgSimple(session);
+app.use(session({
+  store: new pgSession({
+    pool: pool,
+    tableName: 'session'
+  }),
+  secret: process.env.SESSION_SECRET || 'cuba-casa-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: false,
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000
+  }
+}));
+
 // Middleware
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.urlencoded({ extended: false }));
+app.use('/uploads', express.static(uploadsDir));
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Cuba Casa API is running!',
-    timestamp: new Date().toISOString()
-  });
-});
+// Database helper functions
+const dbHelpers = {
+  async getUserByEmail(email) {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    return result.rows[0];
+  },
+  
+  async createUser(email, password) {
+    const result = await pool.query(
+      'INSERT INTO users (email, password) VALUES ($1, $2) RETURNING id, email',
+      [email, password]
+    );
+    return result.rows[0];
+  },
+  
+  async getAllProperties() {
+    const result = await pool.query('SELECT * FROM properties ORDER BY created_at DESC');
+    return result.rows;
+  },
+  
+  async createProperty(propertyData) {
+    const {
+      title, address, description, price, lat, lng, user_id,
+      images, bedrooms, bathrooms, area, type, contact
+    } = propertyData;
+    
+    const result = await pool.query(\`
+      INSERT INTO properties (
+        title, address, description, price, lat, lng, user_id,
+        images, bedrooms, bathrooms, area, type, contact
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING *
+    \`, [
+      title, address, description, price, lat, lng, user_id,
+      JSON.stringify(images || []), bedrooms, bathrooms, area, type, contact
+    ]);
+    
+    return result.rows[0];
+  },
+  
+  async deleteProperty(id, userId) {
+    const result = await pool.query(
+      'DELETE FROM properties WHERE id = $1 AND user_id = $2 RETURNING *',
+      [id, userId]
+    );
+    return result.rows[0];
+  }
+};
 
-// Properties API
-app.get('/api/properties', (req, res) => {
-  res.json([
-    {
-      id: 1,
-      title: "Casa en La Habana",
-      address: "Centro Habana",
-      price: "$50,000",
-      lat: 23.1136,
-      lng: -82.3666
-    },
-    {
-      id: 2, 
-      title: "Apartamento en Vedado",
-      address: "El Vedado",
-      price: "$75,000",
-      lat: 23.1319,
-      lng: -82.3831
+// Email functions
+async function sendWelcomeEmail(email) {
+  if (!process.env.SENDGRID_API_KEY) return;
+  
+  const msg = {
+    to: email,
+    from: 'cubacasa@example.com',
+    subject: '¡Bienvenido a Cuba Casa!',
+    html: \`
+      <h1>¡Bienvenido a Cuba Casa!</h1>
+      <p>Gracias por registrarte en nuestra plataforma de propiedades en Cuba.</p>
+    \`
+  };
+  
+  try {
+    await sgMail.send(msg);
+  } catch (error) {
+    console.error('Error sending email:', error);
+  }
+}
+
+// API Routes
+app.post('/api/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email y contraseña requeridos' });
     }
-  ]);
+    
+    const existingUser = await dbHelpers.getUserByEmail(email.toLowerCase());
+    if (existingUser) {
+      return res.status(400).json({ error: 'El usuario ya existe' });
+    }
+    
+    const user = await dbHelpers.createUser(email.toLowerCase(), password);
+    await sendWelcomeEmail(email);
+    
+    res.json({ id: user.id, email: user.email });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ error: 'Error al registrar usuario' });
+  }
 });
 
-// Main page
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const user = await dbHelpers.getUserByEmail(email.toLowerCase());
+    if (!user || user.password !== password) {
+      return res.status(401).json({ error: 'Credenciales inválidas' });
+    }
+    
+    req.session.userId = user.id;
+    res.json({ id: user.id, email: user.email });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Error al iniciar sesión' });
+  }
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ message: 'Sesión cerrada' });
+});
+
+app.get('/api/user', (req, res) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'No autenticado' });
+  }
+  res.json({ id: req.session.userId });
+});
+
+app.get('/api/properties', async (req, res) => {
+  try {
+    const properties = await dbHelpers.getAllProperties();
+    res.json(properties);
+  } catch (error) {
+    console.error('Error loading properties:', error);
+    res.status(500).json({ error: 'Error al cargar propiedades' });
+  }
+});
+
+app.post('/api/properties', async (req, res) => {
+  try {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: 'No autenticado' });
+    }
+    
+    const propertyData = {
+      ...req.body,
+      user_id: req.session.userId.toString()
+    };
+    
+    const property = await dbHelpers.createProperty(propertyData);
+    res.json(property);
+  } catch (error) {
+    console.error('Error creating property:', error);
+    res.status(500).json({ error: 'Error al crear propiedad' });
+  }
+});
+
+app.delete('/api/properties/:id', async (req, res) => {
+  try {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: 'No autenticado' });
+    }
+    
+    const deletedProperty = await dbHelpers.deleteProperty(req.params.id, req.session.userId.toString());
+    if (!deletedProperty) {
+      return res.status(404).json({ error: 'Propiedad no encontrada' });
+    }
+    
+    res.json({ message: 'Propiedad eliminada' });
+  } catch (error) {
+    console.error('Error deleting property:', error);
+    res.status(500).json({ error: 'Error al eliminar propiedad' });
+  }
+});
+
+app.post('/api/upload', upload.array('images', 7), (req, res) => {
+  try {
+    if (!req.files || !Array.isArray(req.files)) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+    
+    const fileUrls = req.files.map(file => \`/uploads/\${file.filename}\`);
+    res.json({ urls: fileUrls });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// Serve main HTML page with all functionality embedded
 app.get('*', (req, res) => {
-  res.send(`<!DOCTYPE html>
+  res.send(\`<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cuba Casa - Mapa de Propiedades</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; }
     
-    .header {
-      position: absolute;
-      top: 20px;
-      left: 20px;
-      z-index: 1000;
-      background: white;
-      padding: 20px;
-      border-radius: 12px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-      border-left: 4px solid #c41e3a;
+    body { 
+      font-family: 'Poppins', sans-serif; 
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
     }
     
-    .header h1 {
-      color: #c41e3a;
-      font-size: 28px;
-      margin-bottom: 5px;
-      font-weight: bold;
+    .cuba-title {
+      background: linear-gradient(135deg, #c41e3a 0%, #0066cc 50%, #ffb703 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      font-family: 'Playfair Display', serif;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 0.5rem;
+      line-height: 0.9;
     }
     
-    .header p {
-      color: #666;
+    .cuba-subtitle {
+      color: #4a5568;
+      text-align: center;
+      font-size: 1.125rem;
+      margin-bottom: 2rem;
+      font-weight: 400;
+    }
+    
+    .cuba-button-primary {
+      background: linear-gradient(135deg, #c41e3a 0%, #e53e3e 100%);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 4px 15px rgba(196, 30, 58, 0.3);
+    }
+    
+    .cuba-button-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(196, 30, 58, 0.4);
+    }
+    
+    .cuba-button-secondary {
+      background: linear-gradient(135deg, #0066cc 0%, #0080ff 100%);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 4px 15px rgba(0, 102, 204, 0.3);
+    }
+    
+    .cuba-button-secondary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 102, 204, 0.4);
+    }
+    
+    .cuba-input {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e2e8f0;
+      border-radius: 8px;
       font-size: 14px;
-      margin: 0;
+      transition: all 0.3s ease;
+      background: white;
+    }
+    
+    .cuba-input:focus {
+      outline: none;
+      border-color: #c41e3a;
+      box-shadow: 0 0 0 3px rgba(196, 30, 58, 0.1);
+    }
+    
+    .cuba-card {
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 16px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
     }
     
     #map {
-      height: 100vh;
+      height: 70vh;
       width: 100%;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+      overflow: hidden;
     }
     
-    .leaflet-popup-content h3 {
-      color: #c41e3a;
-      margin-bottom: 10px;
+    .auth-panel, .property-form {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 2000;
+      background: white;
+      padding: 2rem;
+      border-radius: 16px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+      max-width: 600px;
+      width: 90%;
+      max-height: 80vh;
+      overflow-y: auto;
     }
     
-    .leaflet-popup-content p {
-      margin: 5px 0;
+    .overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 1999;
+    }
+    
+    .user-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    
+    @media (max-width: 768px) {
+      .cuba-title { font-size: 3rem; }
+      .user-controls { justify-content: center; }
+      #map { height: 60vh; }
     }
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1>🏠 Cuba Casa</h1>
-    <p>Encuentra propiedades en Cuba</p>
-  </div>
-  
-  <div id="map"></div>
+  <div id="app"></div>
   
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
   <script>
-    // Initialize map centered on Cuba
-    const map = L.map('map').setView([23.1136, -82.3666], 7);
+    let currentUser = null;
+    let map = null;
+    let properties = [];
+    let markerClusterGroup = null;
+    let selectedLocation = null;
     
-    // Add OpenStreetMap tiles
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '© OpenStreetMap contributors'
-    }).addTo(map);
-    
-    // Custom marker icon
-    const houseIcon = L.divIcon({
-      html: '🏠',
-      iconSize: [30, 30],
-      className: 'custom-marker'
+    document.addEventListener('DOMContentLoaded', function() {
+      initializeApp();
     });
     
-    // Load and display properties
-    fetch('/api/properties')
-      .then(response => response.json())
-      .then(properties => {
-        console.log('Propiedades cargadas:', properties.length);
+    function initializeApp() {
+      checkAuth();
+      renderUI();
+      initializeMap();
+      loadProperties();
+    }
+    
+    async function checkAuth() {
+      try {
+        const response = await fetch('/api/user', { credentials: 'include' });
+        if (response.ok) {
+          currentUser = await response.json();
+        }
+      } catch (error) {
+        console.log('No authenticated user');
+      }
+    }
+    
+    function renderUI() {
+      const app = document.getElementById('app');
+      app.innerHTML = \\\`
+        <div style="padding: 1rem;">
+          <div class="text-center" style="margin-bottom: 2rem;">
+            <h1 class="cuba-title" style="font-size: 6rem;">Cuba Casa</h1>
+            <p class="cuba-subtitle">Encuentra tu hogar perfecto en Cuba</p>
+          </div>
+          
+          <div class="user-controls">
+            <div id="search-bar">
+              <input type="text" class="cuba-input" placeholder="Buscar por zona..." style="width: 250px;" />
+            </div>
+            
+            <div id="auth-controls">
+              \\\${currentUser ? \\\`
+                <span>Hola, <strong>\\\${currentUser.email || currentUser.id}</strong></span>
+                <button onclick="logout()" class="cuba-button-secondary">Cerrar sesión</button>
+              \\\` : \\\`
+                <button onclick="showAuth('login')" class="cuba-button-secondary">Iniciar sesión</button>
+                <button onclick="showAuth('register')" class="cuba-button-primary">Registrarse</button>
+              \\\`}
+            </div>
+          </div>
+          
+          \\\${currentUser ? \\\`
+            <div class="cuba-card" style="padding: 1rem; margin-bottom: 1rem;">
+              <p><strong>Panel de Usuario:</strong> Haz clic en el mapa para agregar una nueva propiedad.</p>
+            </div>
+          \\\` : ''}
+          
+          <div id="map"></div>
+        </div>
         
-        properties.forEach(property => {
-          L.marker([property.lat, property.lng], {icon: houseIcon})
-            .addTo(map)
-            .bindPopup(\`
-              <div style="min-width: 200px;">
-                <h3>\${property.title}</h3>
-                <p><strong>📍 Dirección:</strong> \${property.address}</p>
-                <p><strong>💰 Precio:</strong> \${property.price}</p>
-                <p style="margin-top: 10px; font-size: 12px; color: #888;">
-                  Haz clic para más detalles
-                </p>
-              </div>
-            \`);
+        <div id="modal-overlay" class="overlay" style="display: none;" onclick="closeModal()"></div>
+        <div id="modal-content" style="display: none;"></div>
+      \\\`;
+    }
+    
+    function initializeMap() {
+      map = L.map('map').setView([23.1136, -82.3666], 7);
+      
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+      }).addTo(map);
+      
+      markerClusterGroup = L.markerClusterGroup();
+      map.addLayer(markerClusterGroup);
+      
+      if (currentUser) {
+        map.on('click', function(e) {
+          showPropertyForm(e.latlng);
         });
-      })
-      .catch(error => {
-        console.error('Error cargando propiedades:', error);
+      }
+    }
+    
+    async function loadProperties() {
+      try {
+        const response = await fetch('/api/properties');
+        if (response.ok) {
+          properties = await response.json();
+          displayProperties();
+        }
+      } catch (error) {
+        console.error('Error loading properties:', error);
+      }
+    }
+    
+    function displayProperties() {
+      markerClusterGroup.clearLayers();
+      
+      properties.forEach(property => {
+        if (property.lat && property.lng) {
+          const marker = L.marker([parseFloat(property.lat), parseFloat(property.lng)])
+            .bindPopup(\\\`
+              <div style="min-width: 250px;">
+                <h3 style="color: #c41e3a; margin-bottom: 8px;">\\\${property.title}</h3>
+                <p><strong>📍 Dirección:</strong> \\\${property.address || 'No especificada'}</p>
+                <p><strong>💰 Precio:</strong> \\\${property.price || 'Consultar'}</p>
+                <p><strong>📝 Descripción:</strong> \\\${property.description || 'Sin descripción'}</p>
+                \\\${property.bedrooms ? \\\`<p><strong>🛏️ Habitaciones:</strong> \\\${property.bedrooms}</p>\\\` : ''}
+                \\\${property.bathrooms ? \\\`<p><strong>🚿 Baños:</strong> \\\${property.bathrooms}</p>\\\` : ''}
+                \\\${property.area ? \\\`<p><strong>📐 Área:</strong> \\\${property.area} m²</p>\\\` : ''}
+                \\\${property.type ? \\\`<p><strong>🏠 Tipo:</strong> \\\${property.type}</p>\\\` : ''}
+                \\\${property.contact ? \\\`<p><strong>📞 Contacto:</strong> \\\${property.contact}</p>\\\` : ''}
+                \\\${currentUser && currentUser.id == property.user_id ? \\\`
+                  <div style="margin-top: 10px;">
+                    <button onclick="deleteProperty(\\\${property.id})" style="background: #dc2626; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Eliminar</button>
+                  </div>
+                \\\` : ''}
+              </div>
+            \\\`);
+          
+          markerClusterGroup.addLayer(marker);
+        }
       });
+    }
+    
+    function showAuth(mode) {
+      const modalContent = document.getElementById('modal-content');
+      modalContent.innerHTML = \\\`
+        <div class="auth-panel">
+          <h3 style="text-align: center; margin-bottom: 1.5rem; color: #4a5568;">
+            \\\${mode === 'login' ? 'Iniciar Sesión' : 'Crear Cuenta'}
+          </h3>
+          <form onsubmit="\\\${mode === 'login' ? 'handleLogin' : 'handleRegister'}(event)">
+            <div style="margin-bottom: 1rem;">
+              <input type="email" id="auth-email" class="cuba-input" placeholder="Email" required />
+            </div>
+            <div style="margin-bottom: 1.5rem;">
+              <input type="password" id="auth-password" class="cuba-input" placeholder="Contraseña" required minlength="6" />
+            </div>
+            <button type="submit" class="cuba-button-primary" style="width: 100%;">
+              \\\${mode === 'login' ? 'Entrar' : 'Crear Cuenta'}
+            </button>
+          </form>
+          <p style="text-align: center; margin-top: 1rem; font-size: 14px;">
+            \\\${mode === 'login' ? '¿No tienes cuenta?' : '¿Ya tienes cuenta?'}
+            <a href="#" onclick="showAuth('\\\${mode === 'login' ? 'register' : 'login'}')" style="color: #c41e3a; text-decoration: none;">
+              \\\${mode === 'login' ? 'Regístrate aquí' : 'Inicia sesión aquí'}
+            </a>
+          </p>
+        </div>
+      \\\`;
+      showModal();
+    }
+    
+    async function handleLogin(event) {
+      event.preventDefault();
+      const email = document.getElementById('auth-email').value;
+      const password = document.getElementById('auth-password').value;
+      
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email.toLowerCase(), password })
+        });
+        
+        if (response.ok) {
+          currentUser = await response.json();
+          closeModal();
+          initializeApp();
+        } else {
+          const error = await response.json();
+          alert(error.error || 'Error al iniciar sesión');
+        }
+      } catch (error) {
+        alert('Error de conexión');
+      }
+    }
+    
+    async function handleRegister(event) {
+      event.preventDefault();
+      const email = document.getElementById('auth-email').value;
+      const password = document.getElementById('auth-password').value;
+      
+      try {
+        const response = await fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email.toLowerCase(), password })
+        });
+        
+        if (response.ok) {
+          alert('Usuario registrado exitosamente. Ahora puedes iniciar sesión.');
+          showAuth('login');
+        } else {
+          const error = await response.json();
+          alert(error.error || 'Error al registrar');
+        }
+      } catch (error) {
+        alert('Error de conexión');
+      }
+    }
+    
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+        currentUser = null;
+        initializeApp();
+      } catch (error) {
+        console.error('Error al cerrar sesión:', error);
+      }
+    }
+    
+    function showPropertyForm(latlng) {
+      selectedLocation = latlng;
+      const modalContent = document.getElementById('modal-content');
+      modalContent.innerHTML = \\\`
+        <div class="property-form">
+          <h3 style="text-align: center; margin-bottom: 1.5rem; color: #4a5568;">Agregar Nueva Propiedad</h3>
+          <form onsubmit="handlePropertySubmit(event)">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+              <input type="text" id="prop-title" class="cuba-input" placeholder="Título de la propiedad" required />
+              <input type="text" id="prop-price" class="cuba-input" placeholder="Precio" />
+            </div>
+            <div style="margin-bottom: 1rem;">
+              <input type="text" id="prop-address" class="cuba-input" placeholder="Dirección" />
+            </div>
+            <div style="margin-bottom: 1rem;">
+              <textarea id="prop-description" class="cuba-input" placeholder="Descripción" rows="3" style="resize: vertical;"></textarea>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+              <input type="number" id="prop-bedrooms" class="cuba-input" placeholder="Habitaciones" min="0" />
+              <input type="number" id="prop-bathrooms" class="cuba-input" placeholder="Baños" step="0.5" min="0" />
+              <input type="number" id="prop-area" class="cuba-input" placeholder="Área (m²)" min="0" />
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+              <select id="prop-type" class="cuba-input">
+                <option value="">Tipo de propiedad</option>
+                <option value="Casa">Casa</option>
+                <option value="Apartamento">Apartamento</option>
+                <option value="Terreno">Terreno</option>
+                <option value="Local comercial">Local comercial</option>
+              </select>
+              <input type="text" id="prop-contact" class="cuba-input" placeholder="Información de contacto" />
+            </div>
+            <div style="display: flex; gap: 1rem; margin-top: 1.5rem;">
+              <button type="button" onclick="closeModal()" class="cuba-button-secondary" style="flex: 1;">Cancelar</button>
+              <button type="submit" class="cuba-button-primary" style="flex: 1;">Guardar Propiedad</button>
+            </div>
+          </form>
+        </div>
+      \\\`;
+      showModal();
+    }
+    
+    async function handlePropertySubmit(event) {
+      event.preventDefault();
+      
+      const propertyData = {
+        title: document.getElementById('prop-title').value,
+        address: document.getElementById('prop-address').value,
+        description: document.getElementById('prop-description').value,
+        price: document.getElementById('prop-price').value,
+        bedrooms: document.getElementById('prop-bedrooms').value || null,
+        bathrooms: document.getElementById('prop-bathrooms').value || null,
+        area: document.getElementById('prop-area').value || null,
+        type: document.getElementById('prop-type').value,
+        contact: document.getElementById('prop-contact').value,
+        lat: selectedLocation.lat,
+        lng: selectedLocation.lng
+      };
+      
+      try {
+        const response = await fetch('/api/properties', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(propertyData)
+        });
+        
+        if (response.ok) {
+          closeModal();
+          loadProperties();
+        } else {
+          const error = await response.json();
+          alert(error.error || 'Error al guardar propiedad');
+        }
+      } catch (error) {
+        alert('Error de conexión');
+      }
+    }
+    
+    async function deleteProperty(propertyId) {
+      if (!confirm('¿Estás seguro de que quieres eliminar esta propiedad?')) {
+        return;
+      }
+      
+      try {
+        const response = await fetch(\\\`/api/properties/\\\${propertyId}\\\`, {
+          method: 'DELETE'
+        });
+        
+        if (response.ok) {
+          loadProperties();
+        } else {
+          const error = await response.json();
+          alert(error.error || 'Error al eliminar propiedad');
+        }
+      } catch (error) {
+        alert('Error de conexión');
+      }
+    }
+    
+    function showModal() {
+      document.getElementById('modal-overlay').style.display = 'block';
+      document.getElementById('modal-content').style.display = 'block';
+    }
+    
+    function closeModal() {
+      document.getElementById('modal-overlay').style.display = 'none';
+      document.getElementById('modal-content').style.display = 'none';
+    }
   </script>
 </body>
-</html>`);
+</html>\`);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('Cuba Casa server running on port ' + PORT);
-  console.log('Visit: http://localhost:' + PORT);
+  console.log(\`Cuba Casa server running on port \${PORT}\`);
 });
